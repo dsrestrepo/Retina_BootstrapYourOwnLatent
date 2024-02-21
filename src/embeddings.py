@@ -1,5 +1,6 @@
 from .data_loader import ImageFolderDataset
 from .model import FoundationalCVModel
+from .RetFound import get_retfound
 
 from torch.utils.data import DataLoader
 import torch
@@ -41,7 +42,6 @@ from sklearn.neighbors import KNeighborsClassifier
 ## Embeddings Visualization
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
-from umap import UMAP
 import plotly.graph_objects as go
 import plotly.express as px
 
@@ -51,7 +51,7 @@ warnings.filterwarnings("ignore")
 
 
 # Define a function to generate embeddings in parallel
-def generate_embeddings(batch, batch_number, model):
+def generate_embeddings(batch, batch_number, model, device='cpu'):
     """
     Generate image embeddings for a batch of images using the specified model.
 
@@ -72,7 +72,7 @@ def generate_embeddings(batch, batch_number, model):
     - This function processes a batch of images and generates embeddings for each image.
     - It is typically used in a data loading pipeline to generate embeddings for a dataset.
     """
-    img_names, images = batch[0], batch[1]
+    img_names, images = batch[0], batch[1].to(device)
 
     with torch.no_grad():
         features = model(images)
@@ -80,10 +80,10 @@ def generate_embeddings(batch, batch_number, model):
     if batch_number % 10 == 0:
         print(f"Processed batch number: {batch_number}")
 
-    return img_names, features
+    return img_names, features.cpu()
 
 
-def get_embeddings_df(batch_size=32, path="../BRSET/images/", backbone="dinov2", directory='Embeddings'):
+def get_embeddings_df(batch_size=32, path="../BRSET/images/", backbone="dinov2", directory='Embeddings', weights=None, device=None):
     """
     Generate image embeddings and save them in a DataFrame.
 
@@ -104,7 +104,12 @@ def get_embeddings_df(batch_size=32, path="../BRSET/images/", backbone="dinov2",
     - The resulting DataFrame contains image names and their corresponding embeddings.
 
     """
-    print('#'*50, f' {backbone} ', '#'*50)
+    if type(backbone) == str:
+        print('#'*50, f' {backbone} ', '#'*50)
+    else:
+        print('#'*50, f' Generating Embeddings ', '#'*50)
+    if not device:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Create the custom dataset
     shape = (224, 224)
@@ -112,14 +117,27 @@ def get_embeddings_df(batch_size=32, path="../BRSET/images/", backbone="dinov2",
     
     # Create a DataLoader to generate embeddings
     batch_size = batch_size
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    model = FoundationalCVModel(backbone)
+    if type(backbone) == str:
+        if backbone == 'retfound':
+            model = get_retfound(weights=weights, backbone=True)
+        else:
+            model = FoundationalCVModel(backbone)
+    else:
+        model = backbone
+                
+    model.to(device)
+
+    # Use DataParallel to parallelize the model across multiple GPUs
+    #if torch.cuda.device_count() > 1:
+        #print("Using", torch.cuda.device_count(), "GPUs!")
+        #model = torch.nn.DataParallel(model, [0,1])
 
     img_names = []
     features = []
     for batch_number, batch in enumerate(dataloader, start=1):
-        img_names_aux, features_aux = generate_embeddings(batch, batch_number, model)
+        img_names_aux, features_aux = generate_embeddings(batch, batch_number, model, device)
         img_names.append(img_names_aux)
         features.append(features_aux)
 
@@ -147,12 +165,15 @@ def get_embeddings_df(batch_size=32, path="../BRSET/images/", backbone="dinov2",
 
     if not os.path.exists(directory):
         os.makedirs(directory)
-        
-    df.to_csv(f'{directory}/Embeddings_{backbone}.csv', index=False)
+    
+    if type(backbone) == str:
+        df.to_csv(f'{directory}/Embeddings_{backbone}.csv', index=False)
+    else:
+        df.to_csv(f'{directory}/Embeddings.csv', index=False)
     
 
 
-def load_data(labels_path='data/labels.csv', backbone='dinov2_large', label='diabetic_retinopathy', directory='Embeddings', dataset_name='BRSET', normal=False, DR_ICDR_3=True, extra_labels=None):
+def load_data(labels_path='data/labels.csv', backbone='dinov2_large', label='diabetic_retinopathy', directory='Embeddings', dataset_name='BRSET', normal=False, DR_ICDR_3=True, extra_labels=None, quality=False):
     """
     Load and prepare data for a machine learning task using image embeddings and corresponding labels.
 
@@ -182,7 +203,11 @@ def load_data(labels_path='data/labels.csv', backbone='dinov2_large', label='dia
     """
 
     # Embeddings
-    embeddings_path = f'{directory}/Embeddings_{backbone}.csv'
+    if type(backbone) == str:
+        embeddings_path = f'{directory}/Embeddings_{backbone}.csv'
+    else:
+        embeddings_path = f'{directory}/Embeddings.csv'
+        
     df = pd.read_csv(embeddings_path)
     df.rename(columns={'ImageName':'image_id'}, inplace=True)
     df['image_id'] = df['image_id'].apply(lambda x: x.replace('.jpg',''))
@@ -204,7 +229,7 @@ def load_data(labels_path='data/labels.csv', backbone='dinov2_large', label='dia
         brset_df['patient_age'].fillna(brset_df['patient_age'].mean(), inplace=True)
         # One-hot encode categorical variables:
         brset_df = pd.get_dummies(brset_df, columns=['camera', 'optic_disc', 'diabetes'])
-            
+        
     elif ('messidor' in dataset_name.lower()):
         # Labels
         brset_df = pd.read_csv(labels_path)
@@ -226,32 +251,80 @@ def load_data(labels_path='data/labels.csv', backbone='dinov2_large', label='dia
     # Merge
     df = brset_df.merge(df, on='image_id')
     
-    y = df[label]
-    X = df.iloc[:, brset_df.shape[1]:]
+    # remove image field of quiality: quality == 'Adequate if 'focus', 'iluminaton', 'artifacts' == 2; quality = 'Inadequate if 'focus', 'iluminaton', 'artifacts' == 1
+    df['quality'] = df.apply(lambda x: 'Adequate' if (x['focus'] == 1) or (x['iluminaton'] == 1) or (x['artifacts'] == 1) else 'Inadequate', axis=1)
     
-    # Check if extra_labels is a list and not None
-    if extra_labels is not None and isinstance(extra_labels, list):
-        # Select the specified extra_labels columns from the DataFrame and append them to the features set (X)
-        extra_labels_df = df[extra_labels]
-        X = pd.concat([X, extra_labels_df], axis=1)
+    if quality == 'focus':
+        df['quality'] = df.apply(lambda x: 'Adequate' if (x['focus'] == 1) else 'Inadequate', axis=1)
+    elif quality == 'iluminaton':
+        df['quality'] = df.apply(lambda x: 'Adequate' if (x['iluminaton'] == 1) else 'Inadequate', axis=1)
+    elif quality == 'artifacts':
+        df['quality'] = df.apply(lambda x: 'Adequate' if (x['artifacts'] == 1) else 'Inadequate', axis=1)
+        
     
-    if label in ['DR_ICDR', 'diagnosis', 'level']:
-        if DR_ICDR_3:
-            # 0: Normal = 0
-            # 1, 2, 3 Non-proliferative = 1
-            # 4 Proliferative = 2
-            y = y.apply(lambda x: 1 if x in (1, 2, 3) else (2 if x == 4 else 0))
-        else:
-            pass
     
-    if dataset_name == 'BRSET':        
-        if label == 'diabetes':
-            y = y.apply(lambda x: 1 if x == 'yes' else 0)
+    if quality:
+        df_quality = df[df['quality'] == 'Adequate']
+        df_bad_quality = df[df['quality'] == 'Inadequate']
+        y_quality = df_quality[label]
+        y_bad_quality = df_bad_quality[label]
+        X_quality = df_quality.iloc[:, brset_df.shape[1]:]
+        X_bad_quality = df_bad_quality.iloc[:, brset_df.shape[1]:]
+        
+        # Check if extra_labels is a list and not None
+        if extra_labels is not None and isinstance(extra_labels, list):
+            # Select the specified extra_labels columns from the DataFrame and append them to the features set (X)
+            extra_labels_df = df_quality[extra_labels]
+            X_quality = pd.concat([X_quality, extra_labels_df], axis=1)
+            
+            # Select the specified extra_labels columns from the DataFrame and append them to the features set (X)
+            extra_labels_df = df_bad_quality[extra_labels]
+            X_bad_quality = pd.concat([X_bad_quality, extra_labels_df], axis=1)
+        
+        if label in ['DR_ICDR', 'diagnosis', 'level']:
+            if DR_ICDR_3:
+                # 0: Normal = 0
+                # 1, 2, 3 Non-proliferative = 1
+                # 4 Proliferative = 2
+                y_quality = y_quality.apply(lambda x: 1 if x in (1, 2, 3) else (2 if x == 4 else 0))
+                y_bad_quality = y_bad_quality.apply(lambda x: 1 if x in (1, 2, 3) else (2 if x == 4 else 0))
+            else:
+                pass
+        if dataset_name == 'BRSET':
+            if label == 'diabetes':
+                y_quality = y_quality.apply(lambda x: 1 if x == 'yes' else 0)
+                y_bad_quality = y_bad_quality.apply(lambda x: 1 if x == 'yes' else 0)
+            if label == 'patient_sex':
+                y_quality = y_quality.apply(lambda x: 0 if x == 2 else 1) 
+                y_bad_quality = y_bad_quality.apply(lambda x: 0 if x == 2 else 1)
+        return X_quality, y_quality, X_bad_quality, y_bad_quality
+    else:    
+        y = df[label]
+        X = df.iloc[:, brset_df.shape[1]:]
+        
+        # Check if extra_labels is a list and not None
+        if extra_labels is not None and isinstance(extra_labels, list):
+            # Select the specified extra_labels columns from the DataFrame and append them to the features set (X)
+            extra_labels_df = df[extra_labels]
+            X = pd.concat([X, extra_labels_df], axis=1)
+        
+        if label in ['DR_ICDR', 'diagnosis', 'level']:
+            if DR_ICDR_3:
+                # 0: Normal = 0
+                # 1, 2, 3 Non-proliferative = 1
+                # 4 Proliferative = 2
+                y = y.apply(lambda x: 1 if x in (1, 2, 3) else (2 if x == 4 else 0))
+            else:
+                pass
+        
+        if dataset_name == 'BRSET':        
+            if label == 'diabetes':
+                y = y.apply(lambda x: 1 if x == 'yes' else 0)
 
-        if label == 'patient_sex':
-            y = y.apply(lambda x: 0 if x == 2 else 1) 
-    
-    return X, y
+            if label == 'patient_sex':
+                y = y.apply(lambda x: 0 if x == 2 else 1) 
+        
+        return X, y
 
 
 def split_dataset(X, y, test_size=0.3, random_state=1, plot=True):
@@ -290,7 +363,7 @@ def split_dataset(X, y, test_size=0.3, random_state=1, plot=True):
     """
     
     # Split the data into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
     
     print(f"Training set size is: {len(X_train)} rows and {X_train.shape[1]} columns")
     print(f"Test set size is: {len(X_test)} rows and {X_test.shape[1]} columns")
@@ -303,7 +376,12 @@ def split_dataset(X, y, test_size=0.3, random_state=1, plot=True):
 
         # Get the unique class labels
         unique_labels = np.unique(np.concatenate((y_train, y_test)))
-
+        
+        if len(unique_labels) != len(train_class_counts):
+            print('There are missing classes in the training set')
+            print('Available classes:', unique_labels)
+            return None, None, None, None
+        
         # Create bar plots to visualize class distribution
         plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1)
@@ -373,6 +451,7 @@ def visualize_embeddings(X_train, X_test, y_train, y_test, plot_type='2D', metho
             red = TSNE(n_components=3, perplexity=perplexity, random_state=42).fit(X_train)
             reduced_embeddings = red.transform(X_test)
         elif method == 'UMAP':
+            from umap import UMAP
             # Apply UMAP to reduce the dimensionality of the embeddings
             red = UMAP(n_components=3, random_state=42).fit(X_train)
             reduced_embeddings = red.transform(X_test)
@@ -395,6 +474,7 @@ def visualize_embeddings(X_train, X_test, y_train, y_test, plot_type='2D', metho
             red = TSNE(n_components=2, perplexity=perplexity, random_state=42).fit(X_train)
             reduced_embeddings = red.transform(X_test)
         elif method == 'UMAP':
+            from umap import UMAP
             # Apply UMAP to reduce the dimensionality of the embeddings
             red = UMAP(n_components=2, random_state=42).fit(X_train)
             reduced_embeddings = red.transform(X_test)
@@ -432,10 +512,29 @@ def test_model(X_test, y_test, model):
     y_test: numpy array with test labels
     model: trained model
     """
+    
 
     # Predictions on test data
     y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)
+    
+    
+    
+    
+    if not isinstance(y_test, pd.Series):
+        print('Y_test is not a pandas Series')
+        y_test_series = pd.Series(y_test, index=X_test.index)
+    else:
+        y_test_series = y_test
+
+    # Convert y_pred to a pandas Series using the same index as y_test_series
+    y_pred_series = pd.Series(y_pred, index=y_test_series.index)
+
+    # Identify indices of wrong predictions
+    wrong_predictions = y_test_series != y_pred_series
+    wrong_indices = wrong_predictions[wrong_predictions].index
+    
+    
 
     # Confusion matrix
     # Create a confusion matrix of the test predictions
@@ -508,7 +607,7 @@ def test_model(X_test, y_test, model):
     recall = recall_score(y_test, y_pred, average='weighted')  # Use weighted average for multi-class recall
     f1 = f1_score(y_test, y_pred, average='weighted')  # Use weighted average for multi-class F1-score
 
-    return accuracy, precision, recall, f1
+    return accuracy, precision, recall, f1, wrong_indices
 
 
 def train_and_evaluate_model(X_train, X_test, y_train, y_test, models=None):
@@ -554,7 +653,7 @@ def train_and_evaluate_model(X_train, X_test, y_train, y_test, models=None):
         model.fit(X_train, y_train)
 
         # Make predictions on the testing set
-        accuracy, precision, recall, f1 = test_model(X_test, y_test, model)
+        accuracy, precision, recall, f1, wrong_indices = test_model(X_test, y_test, model)
         
         #print(f"Accuracy: {accuracy:.2f}")
         #print(f"Precision: {precision:.2f}")
@@ -563,4 +662,4 @@ def train_and_evaluate_model(X_train, X_test, y_train, y_test, models=None):
         
         #print('#'*80)
         
-    return models
+    return models, wrong_indices
