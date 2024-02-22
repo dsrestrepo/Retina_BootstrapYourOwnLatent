@@ -39,11 +39,19 @@ from sklearn.tree import DecisionTreeClassifier
 # K-nearest neighbors
 from sklearn.neighbors import KNeighborsClassifier
 
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.layers import Dropout
+from tensorflow.keras.utils import to_categorical
+
 ## Embeddings Visualization
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import plotly.graph_objects as go
 import plotly.express as px
+
+from imblearn.over_sampling import SMOTE
 
 
 import warnings
@@ -327,7 +335,7 @@ def load_data(labels_path='data/labels.csv', backbone='dinov2_large', label='dia
         return X, y
 
 
-def split_dataset(X, y, test_size=0.3, random_state=1, plot=True):
+def split_dataset(X, y, test_size=0.3, random_state=1, plot=True, oversample=False):
     """
     Split a dataset into training and testing sets and optionally visualize class distribution.
 
@@ -367,6 +375,12 @@ def split_dataset(X, y, test_size=0.3, random_state=1, plot=True):
     
     print(f"Training set size is: {len(X_train)} rows and {X_train.shape[1]} columns")
     print(f"Test set size is: {len(X_test)} rows and {X_test.shape[1]} columns")
+    
+    if oversample:
+        # Apply SMOTE to oversample the minority class in the training set
+        smote = SMOTE(random_state=random_state)
+        X_train, y_train = smote.fit_resample(X_train, y_train)
+        print("Applied SMOTE to oversample the training set.")
     
     if plot:
 
@@ -513,12 +527,9 @@ def test_model(X_test, y_test, model):
     model: trained model
     """
     
-
     # Predictions on test data
     y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)
-    
-    
     
     
     if not isinstance(y_test, pd.Series):
@@ -663,3 +674,222 @@ def train_and_evaluate_model(X_train, X_test, y_train, y_test, models=None):
         #print('#'*80)
         
     return models, wrong_indices
+"""
+def test_model_nn(X_test, y_test, model):
+    # Predictions on test data
+    y_pred_probs = model.predict(X_test)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+
+    wrong_indices = np.where(y_test != y_pred)[0]
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    sns.heatmap(cm, annot=True, cmap='Blues', fmt='g')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.show()
+
+    # ROC Curve for binary classification
+    if y_pred_probs.shape[1] == 2:
+        fpr, tpr, _ = roc_curve(y_test, y_pred_probs[:, 1])
+        plt.plot(fpr, tpr, color='aqua')
+        plt.plot([0, 1], [0, 1], linestyle='--', color='black')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Curve')
+        plt.show()
+
+    print(classification_report(y_test, y_pred))
+
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, average='weighted')
+    recall = recall_score(y_test, y_pred, average='weighted')
+    f1 = f1_score(y_test, y_pred, average='weighted')
+
+    return accuracy, precision, recall, f1, wrong_indices
+    
+import tensorflow as tf
+
+def focal_loss(gamma=2., alpha=.25):
+    def focal_loss_fixed(y_true, y_pred):
+        pt_1 = tf.where(tf.equal(y_true, 1), y_pred, tf.ones_like(y_pred))
+        pt_0 = tf.where(tf.equal(y_true, 0), y_pred, tf.zeros_like(y_pred))
+        return -tf.reduce_sum(alpha * tf.pow(1. - pt_1, gamma) * tf.math.log(pt_1)) \
+               -tf.reduce_sum((1 - alpha) * tf.pow(pt_0, gamma) * tf.math.log(1. - pt_0))
+    return focal_loss_fixed
+
+
+def train_and_evaluate_model_nn(X_train, X_test, y_train, y_test, input_dim, num_classes, layers=[128, 64], dropout=0.2, epochs=10, batch_size=32, class_weights=None, loss='focal'):
+    # Convert labels to categorical one-hot encoding
+    y_train_onehot = to_categorical(y_train, num_classes=num_classes)
+    y_test_onehot = to_categorical(y_test, num_classes=num_classes)
+    
+    # Each blok is dense relu, batch normalization, and dropout
+    model = Sequential()
+    for layer in layers:
+        model.add(Dense(layer, activation='relu'))
+        model.add(BatchNormalization())
+        model.add(Dropout(dropout))
+    
+    model.add(Dense(num_classes, activation='softmax'))
+    
+
+    # Compile the model
+    if loss == 'focal':
+        model.compile(optimizer='adam',
+                        loss=focal_loss(),
+                        metrics=['accuracy'])
+    else:
+        model.compile(optimizer='adam',
+                        loss='categorical_crossentropy',
+                        metrics=['accuracy'])
+
+    # Train the model
+    if class_weights:
+        model.fit(X_train, y_train_onehot, epochs=10, batch_size=32, validation_split=0.2, class_weight=class_weights)
+    else:
+        model.fit(X_train, y_train_onehot, epochs=10, batch_size=32, validation_split=0.2)
+    
+    # Evaluate the model
+    results = test_model_nn(X_test, y_test, model)
+
+    return model, results
+
+
+"""
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+class Classifier(nn.Module):
+    def __init__(self, input_dim, hidden_layers, num_classes, dropout=0.2):
+        super(Classifier, self).__init__()
+        layers = []
+
+        for hidden in hidden_layers:
+            layers.append(nn.Linear(input_dim, hidden))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(p=dropout))
+            layers.append(nn.BatchNorm1d(hidden))
+            input_dim = hidden
+
+        # Final layer
+        layers.append(nn.Linear(hidden_layers[-1], num_classes))
+
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+def test_model_nn(X_test, y_test, model, device):
+    model.eval()
+    with torch.no_grad():
+        inputs = torch.tensor(X_test).float().to(device)
+        outputs = model(inputs)
+        _, predicted = torch.max(outputs.data, 1)
+
+    y_pred = predicted.cpu().numpy()
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, average='weighted')
+    recall = recall_score(y_test, y_pred, average='weighted')
+    f1 = f1_score(y_test, y_pred, average='weighted')
+
+    # Confusion Matrix
+    cm = confusion_matrix(y_test, y_pred)
+    sns.heatmap(cm, annot=True, fmt="d", cmap='Blues')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.show()
+
+    print(classification_report(y_test, y_pred))
+
+    return accuracy, precision, recall, f1
+
+def train_model(model, criterion, optimizer, train_loader, device, epochs=10):
+    model.train()
+    for epoch in range(epochs):
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            # Zero the parameter gradients
+            optimizer.zero_grad()
+
+            # Forward + backward + optimize
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+        print(f'Epoch {epoch+1}, Loss: {loss.item()}')
+
+    print('Finished Training')
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        BCE_loss = nn.CrossEntropyLoss(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+        return F_loss.mean()
+
+
+
+def train_and_evaluate_model_nn(X_train, X_test, y_train, y_test, input_dim, num_classes, layers=[128, 64], dropout=0.2, epochs=20, batch_size=128, class_weights=None, loss='cross_entropy'):
+    #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu"
+    model = Classifier(input_dim=input_dim, hidden_layers=layers, num_classes=num_classes, dropout=dropout).to(device)
+
+    #if loss == 'focal_loss':
+    #    criterion = FocalLoss(gamma=2, alpha=class_weights).to(device)
+    #else:
+    criterion = nn.CrossEntropyLoss(weight=class_weights).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    # Convert datasets to PyTorch tensors
+    X_train_tensor = torch.tensor(X_train.values).float()
+    y_train_tensor = torch.tensor(y_train.values).long()
+    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    test_dataset = torch.utils.data.TensorDataset(torch.tensor(X_test.values).float(), torch.tensor(y_test.values).long())
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    train_model(model, criterion, optimizer, train_loader, device, epochs=epochs)
+
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for inputs, _ in test_loader:
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+
+    # Evaluation
+    accuracy = accuracy_score(y_test, all_preds)
+    precision = precision_score(y_test, all_preds, average='weighted')
+    recall = recall_score(y_test, all_preds, average='weighted')
+    f1 = f1_score(y_test, all_preds, average='weighted')
+
+    # Confusion Matrix
+    cm = confusion_matrix(y_test, all_preds)
+    sns.heatmap(cm, annot=True, fmt="d", cmap='Blues')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.show()
+
+    print(classification_report(y_test, all_preds))
+
+    return model, (accuracy, precision, recall, f1)
